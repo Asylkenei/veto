@@ -1,0 +1,178 @@
+include:
+  - project: pipelines/pipelines
+    ref: master
+    file:
+      - /jobs/spirit.yaml
+      - /jobs/build.yaml
+      - /jobs/rules.yaml
+
+stages:
+  - test
+  - image
+  - deploy
+
+variables:
+  DOCKER_ARTIFACTORY_REGISTRY: registry.spirit.t-education.com
+  IMAGE_BACKEND: ${DOCKER_ARTIFACTORY_REGISTRY}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}/backend:${CI_COMMIT_SHORT_SHA}
+  IMAGE_FRONTEND: ${DOCKER_ARTIFACTORY_REGISTRY}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}/frontend:${CI_COMMIT_SHORT_SHA}
+  DEPLOY_IMG: registry.spirit.t-education.com/cicd-images/base-noble:release-1.1.0
+  APP_PORT: "80"
+
+image: node:22-bookworm-slim
+
+# Backend tests on a real PostgreSQL. A failure stops the pipeline: no images, no deploy.
+test:backend:
+  stage: test
+  extends:
+    - .rules-merge-or-master-or-parent
+  image: python:3.12-slim-bookworm
+  services:
+    - name: postgres:17-alpine
+      alias: postgres
+  variables:
+    POSTGRES_USER: veto
+    POSTGRES_PASSWORD: veto-ci
+    POSTGRES_DB: veto
+    TEST_DATABASE_URL: postgresql+psycopg://veto:veto-ci@postgres:5432/veto_test
+    MIGRATION_DATABASE_URL: postgresql+psycopg://veto:veto-ci@postgres:5432/veto
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+  before_script:
+    - cd backend
+    - pip install -q -r requirements-dev.txt
+    - python -m scripts.wait_for_db "$MIGRATION_DATABASE_URL" 60
+  script:
+    - python -m pytest -q
+    # Migrations must apply and roll back cleanly before a release.
+    - DATABASE_URL=$MIGRATION_DATABASE_URL python -m alembic upgrade head
+    - DATABASE_URL=$MIGRATION_DATABASE_URL python -m alembic downgrade base
+    - DATABASE_URL=$MIGRATION_DATABASE_URL python -m alembic upgrade head
+
+# The shared Spirit template provides Kaniko and registry authentication.
+# Build both images from the repository root so they can use their Dockerfiles
+# and the common .dockerignore.
+.build_image:
+  extends:
+    - .dp_build
+    - .rules-merge-or-master-or-parent
+  stage: image
+  inherit:
+    default: false
+  script:
+    - /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile "$CI_PROJECT_DIR/$DOCKERFILE_PATH" --destination "$IMAGE_NAME"
+
+build:image:backend:
+  extends: .build_image
+  needs: [test:backend]
+  variables:
+    IMAGE_NAME: $IMAGE_BACKEND
+    DOCKERFILE_PATH: backend/Dockerfile
+
+build:image:frontend:
+  extends: .build_image
+  needs: [test:backend]
+  variables:
+    IMAGE_NAME: $IMAGE_FRONTEND
+    DOCKERFILE_PATH: frontend/Dockerfile
+
+.ssh_vm:
+  image: $DEPLOY_IMG
+  variables:
+    SSH: "ssh -i $DEPLOY_KEY -o StrictHostKeyChecking=accept-new"
+    SCP: "scp -i $DEPLOY_KEY -o StrictHostKeyChecking=accept-new"
+    VM: "$DEPLOY_USER@$DEPLOY_HOST"
+    DP_CLI_VERSION: "14.1.3"
+  before_script:
+    - ': "${DEPLOY_HOST:?Set DEPLOY_HOST in GitLab CI variables}"'
+    - ': "${DEPLOY_USER:?Set DEPLOY_USER in GitLab CI variables}"'
+    - ': "${DEPLOY_KEY:?Set DEPLOY_KEY as a GitLab file variable}"'
+    - ': "${SPIRIT_DOCKER_SA_KEY:?Set SPIRIT_DOCKER_SA_KEY as a GitLab file variable}"'
+    - ': "${POSTGRES_USER:?Set POSTGRES_USER in GitLab CI variables}"'
+    - ': "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD as a protected GitLab CI variable}"'
+    - ': "${POSTGRES_DB:?Set POSTGRES_DB in GitLab CI variables}"'
+    - command -v ssh >/dev/null || (apt-get update -qq && apt-get install -y -qq --no-install-recommends openssh-client)
+    - chmod 600 "$DEPLOY_KEY"
+
+deploy:vm:
+  stage: deploy
+  extends: .ssh_vm
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == $CI_PROJECT_ID && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+      when: manual
+      allow_failure: false
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: on_success
+    - when: never
+  needs:
+    - job: build:image:backend
+      artifacts: false
+    - job: build:image:frontend
+      artifacts: false
+  resource_group: production
+  script:
+    - $SSH $VM "mkdir -p ~/app/nginx"
+    - $SCP docker-compose.yml "$VM:app/"
+    - $SCP nginx/default.conf "$VM:app/nginx/default.conf"
+    - $SCP "$SPIRIT_DOCKER_SA_KEY" "$VM:app/"
+    - |
+      $SSH $VM "cd ~/app &&
+        chmod 600 $(basename "$SPIRIT_DOCKER_SA_KEY") &&
+        sudo dp auth service-acc --key-file $(basename "$SPIRIT_DOCKER_SA_KEY") &&
+        sudo dp auth configure-docker &&
+        rm -f $(basename "$SPIRIT_DOCKER_SA_KEY")"
+    - |
+      : "${IMAGE_BACKEND:?IMAGE_BACKEND is not defined}"
+      : "${IMAGE_FRONTEND:?IMAGE_FRONTEND is not defined}"
+      : "${POSTGRES_USER:?POSTGRES_USER is not defined}"
+      : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not defined}"
+      : "${POSTGRES_DB:?POSTGRES_DB is not defined}"
+      export APP_VERSION="$CI_COMMIT_SHORT_SHA"
+      # Required values plus optional settings; empty optional values are fine.
+      compose_env() {
+        for name in IMAGE_BACKEND IMAGE_FRONTEND POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB APP_VERSION \
+          PUBLIC_URL COOKIE_SECURE SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SUPPORT_EMAIL \
+          PEXELS_API_KEY UNSPLASH_ACCESS_KEY VAPID_SUBJECT; do
+          eval "value=\${$name:-}"
+          [ -n "$value" ] && printf '%s=%s\n' "$name" "$value"
+        done
+        return 0
+      }
+      compose_env | $SSH $VM "cd ~/app &&
+        umask 077 &&
+        tmp_env=\$(mktemp /tmp/veto-compose.XXXXXX) &&
+        trap 'rm -f \"\$tmp_env\"' EXIT &&
+        cat > \"\$tmp_env\" &&
+        sudo docker compose --env-file \"\$tmp_env\" pull &&
+        sudo docker compose --env-file \"\$tmp_env\" up -d --remove-orphans"
+    - |
+      # Healthy API, the SPA through nginx, and /api/meta reporting *this* commit
+      # (proves the new backend image is running, not the previous one).
+      if $SSH $VM "curl -fsS --retry 30 --retry-delay 3 --retry-all-errors -o /dev/null http://localhost:${APP_PORT}/api/health &&
+          curl -fsS http://localhost:${APP_PORT}/ | grep -q '<div id=\"root\">' &&
+          curl -fsS http://localhost:${APP_PORT}/api/meta | grep -q '\"version\":\"${CI_COMMIT_SHORT_SHA}\"'"; then
+        echo "Deployment ${CI_COMMIT_SHORT_SHA} is healthy at http://$DEPLOY_HOST:${APP_PORT}"
+      else
+        echo "Deployment did not become healthy. Container state and backend logs:"
+        $SSH $VM "sudo docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'; sudo docker logs --tail 80 \$(sudo docker ps -aqf label=com.docker.compose.service=backend | head -1)" || true
+        exit 1
+      fi
+    # Free disk space: unused images older than a day (current ones are in use).
+    - $SSH $VM "sudo docker image prune -af --filter until=24h >/dev/null" || true
+  environment:
+    name: production
+
+# Manual button before the demo: demo accounts (password demo1234) and decisions in every state.
+seed:demo:
+  stage: deploy
+  extends: .ssh_vm
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: manual
+      allow_failure: true
+    - when: never
+  needs: [deploy:vm]
+  script:
+    - $SSH $VM "sudo docker exec \$(sudo docker ps -qf label=com.docker.compose.service=backend | head -1) python -m scripts.seed_demo"

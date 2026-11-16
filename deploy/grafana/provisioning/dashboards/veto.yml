@@ -1,0 +1,3 @@
+apiVersion: 1
+providers:
+  - { name: veto, folder: VETO, type: file, options: { path: /var/lib/grafana/dashboards } }

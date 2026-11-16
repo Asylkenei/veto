@@ -1,0 +1,9 @@
+{
+  "name": "VETO — решайте вместе",
+  "short_name": "VETO",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f6f3",
+  "theme_color": "#1d5c45",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

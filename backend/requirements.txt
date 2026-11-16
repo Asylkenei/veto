@@ -1,0 +1,10 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+SQLAlchemy>=2.0,<3
+pydantic>=2.7,<3
+psycopg[binary]>=3.2,<4
+email-validator>=2.1,<3
+alembic>=1.13,<2
+prometheus-client>=0.20,<1
+pywebpush>=2.0,<3
+httpx>=0.27,<1  # used by scripts.seed_demo inside the image
